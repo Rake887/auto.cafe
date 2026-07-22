@@ -1,0 +1,135 @@
+name: qrmenu
+
+services:
+  db:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-qrmenu}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-qrmenu}
+      POSTGRES_DB: ${POSTGRES_DB:-qrmenu}
+    ports:
+      # 55433 наружу: стандартный 5432 на машине разработчика обычно занят
+      - "${DB_PORT:-55433}:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-qrmenu} -d ${POSTGRES_DB:-qrmenu}"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+      start_period: 10s
+
+  api:
+    build: ./backend
+    restart: unless-stopped
+    environment:
+      DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER:-qrmenu}:${POSTGRES_PASSWORD:-qrmenu}@db:5432/${POSTGRES_DB:-qrmenu}
+      BOT_TOKEN: ${BOT_TOKEN:-}
+      # Пусто — адрес спрашивается у cloudflared при старте (см. ниже)
+      WEBHOOK_URL: ${WEBHOOK_URL:-}
+      TUNNEL_METRICS_URL: http://cloudflared:2000
+      WEBHOOK_PATH_PREFIX: /api
+      WEBHOOK_SECRET: ${WEBHOOK_SECRET:-change-me}
+      GROUP_CHAT_ID: ${GROUP_CHAT_ID:-0}
+      ORDER_REMINDER_MINUTES: ${ORDER_REMINDER_MINUTES:-5}
+      SERVICE_CALL_SLA_SECONDS: ${SERVICE_CALL_SLA_SECONDS:-90}
+      # локально бот работает опросом: Telegram блокирует адреса
+      # бесплатных туннелей, и вебхук туда не встаёт
+      BOT_POLLING: ${BOT_POLLING:-1}
+      DEMO_ORGANIZATION_ID: ${DEMO_ORGANIZATION_ID:-1}
+      DEMO_TOKEN: ${DEMO_TOKEN:-demo}
+      ADMIN_TOKEN: ${ADMIN_TOKEN:-}
+      CORS_ORIGINS: ${CORS_ORIGINS:-*}
+    ports:
+      - "${API_PORT:-8010}:8000"
+    volumes:
+      # фотографии блюд переживают пересборку образа
+      - media:/srv/media
+    depends_on:
+      db:
+        condition: service_healthy
+    # миграции применяются на старте — отдельный шаг руками не нужен
+    command: sh -c "alembic upgrade head && uvicorn app.main:app --host 0.0.0.0 --port 8000"
+    healthcheck:
+      test: ["CMD-SHELL", "python -c \"import urllib.request;urllib.request.urlopen('http://localhost:8000/health')\""]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
+
+  web:
+    build:
+      context: ./frontend
+      args:
+        # Относительный путь: браузер гостя идёт в API через тот же адрес,
+        # с которого открыл страницу (см. proxy). Поэтому образ не привязан
+        # ни к localhost, ни к домену — пересобирать при смене адреса не надо.
+        NEXT_PUBLIC_API_BASE: ${PUBLIC_API_BASE:-/api}
+        NEXT_PUBLIC_DEMO_TOKEN: ${DEMO_TOKEN:-demo}
+        # кнопка «Демо-вход в 1 клик» — только на стенде
+        NEXT_PUBLIC_DEMO_LOGIN: ${DEMO_LOGIN:-1}
+    restart: unless-stopped
+    environment:
+      # адрес, по которому в API ходит SSR внутри docker-сети
+      INTERNAL_API_BASE: http://api:8000
+    expose:
+      - "3000"
+    depends_on:
+      api:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://localhost:3000/').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 15s
+
+  # Единая точка входа: меню на /, API на /api — один origin для гостя.
+  proxy:
+    image: caddy:2-alpine
+    restart: unless-stopped
+    volumes:
+      - ./proxy/Caddyfile:/etc/caddy/Caddyfile:ro
+    ports:
+      - "${WEB_PORT:-3000}:80"
+    depends_on:
+      web:
+        condition: service_healthy
+      api:
+        condition: service_healthy
+
+  # Публичный HTTPS-адрес без страницы-предупреждения: отдаёт наружу и меню,
+  # и API одним доменом. Аккаунт не нужен, адрес случайный при каждом запуске.
+  #   docker compose --profile tunnel-cf up -d cloudflared
+  #   docker compose logs cloudflared | grep trycloudflare.com
+  cloudflared:
+    image: cloudflare/cloudflared:latest
+    profiles: ["tunnel-cf"]
+    restart: unless-stopped
+    # --metrics поднимает служебный порт, на котором cloudflared сам сообщает
+    # выданный адрес: этим пользуется api, чтобы не прописывать его руками
+    command: tunnel --url http://proxy:80 --no-autoupdate --metrics 0.0.0.0:2000
+    expose:
+      - "2000"
+    depends_on:
+      - proxy
+
+  # Разовый сидинг демо-данных, запускается вручную:
+  #   docker compose --profile tools run --rm seed
+  seed:
+    build: ./backend
+    profiles: ["tools"]
+    environment:
+      DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER:-qrmenu}:${POSTGRES_PASSWORD:-qrmenu}@db:5432/${POSTGRES_DB:-qrmenu}
+      DEMO_ORGANIZATION_ID: ${DEMO_ORGANIZATION_ID:-1}
+      # тот же токен, что вшит в кнопку «Открыть демо-меню» на фронтенде
+      DEMO_TOKEN: ${DEMO_TOKEN:-demo}
+    depends_on:
+      db:
+        condition: service_healthy
+    command: python -m app.seed
+
+volumes:
+  pgdata:
+  media:

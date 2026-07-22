@@ -1,0 +1,120 @@
+# Продакшн-стек для VPS: свой домен вместо туннеля, порты 80/443 наружу.
+#
+#   docker compose -f docker-compose.prod.yml --env-file .env.prod up -d --build
+#
+# Отличия от локального docker-compose.yml:
+#  - нет cloudflared: адрес постоянный, туннель не нужен;
+#  - прокси слушает 80 и 443 и сам получает сертификат Let's Encrypt;
+#  - база и API наружу не торчат — только через прокси.
+name: qrmenu
+
+services:
+  db:
+    image: postgres:16-alpine
+    restart: always
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: ${POSTGRES_DB}
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER} -d ${POSTGRES_DB}"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+      start_period: 10s
+
+  api:
+    build: ./backend
+    restart: always
+    environment:
+      DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER}:${POSTGRES_PASSWORD}@db:5432/${POSTGRES_DB}
+      BOT_TOKEN: ${BOT_TOKEN}
+      # на проде адрес постоянный, автоопределение через туннель не нужно
+      WEBHOOK_URL: https://${SITE_DOMAIN}/api
+      WEBHOOK_SECRET: ${WEBHOOK_SECRET}
+      GROUP_CHAT_ID: ${GROUP_CHAT_ID}
+      ORDER_REMINDER_MINUTES: ${ORDER_REMINDER_MINUTES:-5}
+      SERVICE_CALL_SLA_SECONDS: ${SERVICE_CALL_SLA_SECONDS:-90}
+      # на своём домене вебхук работает и дешевле опроса
+      BOT_POLLING: ${BOT_POLLING:-0}
+      DEMO_ORGANIZATION_ID: ${DEMO_ORGANIZATION_ID:-1}
+      # пусто: токены столов должны быть случайными, а не «demo»
+      DEMO_TOKEN: ""
+      ADMIN_TOKEN: ${ADMIN_TOKEN}
+      DISPLAY_TIMEZONE: ${DISPLAY_TIMEZONE:-Asia/Almaty}
+      # сайт под HTTPS — cookie сессии не должна уходить по открытому каналу
+      COOKIE_SECURE: "true"
+      CORS_ORIGINS: https://${SITE_DOMAIN}
+    volumes:
+      - media:/srv/media
+    depends_on:
+      db:
+        condition: service_healthy
+    command: sh -c "alembic upgrade head && uvicorn app.main:app --host 0.0.0.0 --port 8000"
+    healthcheck:
+      test: ["CMD-SHELL", "python -c \"import urllib.request;urllib.request.urlopen('http://localhost:8000/health')\""]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+
+  web:
+    build:
+      context: ./frontend
+      args:
+        # относительный путь: браузер идёт в API через тот же домен
+        NEXT_PUBLIC_API_BASE: /api
+        NEXT_PUBLIC_DEMO_TOKEN: ""
+        # На боевом домене кнопки демо-входа быть не должно: она пускает
+        # в кабинет владельца известным паролем. Значение задано явно,
+        # чтобы безопасность не держалась на отсутствии строки.
+        NEXT_PUBLIC_DEMO_LOGIN: "0"
+    restart: always
+    environment:
+      INTERNAL_API_BASE: http://api:8000
+    expose:
+      - "3000"
+    depends_on:
+      api:
+        condition: service_healthy
+
+  proxy:
+    image: caddy:2-alpine
+    restart: always
+    environment:
+      SITE_DOMAIN: ${SITE_DOMAIN}
+      ACME_EMAIL: ${ACME_EMAIL}
+    volumes:
+      - ./proxy/Caddyfile.prod:/etc/caddy/Caddyfile:ro
+      # сертификаты переживают пересоздание контейнера, иначе Let's Encrypt
+      # быстро упрётся в лимит выдачи
+      - caddy_data:/data
+      - caddy_config:/config
+    ports:
+      - "80:80"
+      - "443:443"
+    depends_on:
+      web:
+        condition: service_started
+      api:
+        condition: service_healthy
+
+  seed:
+    build: ./backend
+    profiles: ["tools"]
+    environment:
+      DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER}:${POSTGRES_PASSWORD}@db:5432/${POSTGRES_DB}
+      DEMO_ORGANIZATION_ID: ${DEMO_ORGANIZATION_ID:-1}
+      DEMO_TOKEN: ""
+    depends_on:
+      db:
+        condition: service_healthy
+    command: python -m app.seed
+
+volumes:
+  pgdata:
+  media:
+  caddy_data:
+  caddy_config:

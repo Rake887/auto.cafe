@@ -1,0 +1,233 @@
+@import "tailwindcss";
+
+/*
+  Дизайн-система, пресет «Кофейня» (единственный в MVP), премиальный минимализм.
+
+  Слой 1 — примитивы (:root ниже): сырые значения палитры.
+  Слой 2 — семантические токены (@theme): --color-surface, --color-ink и т.д.
+  Компоненты используют ТОЛЬКО семантические токены (классы bg-surface,
+  text-ink, bg-accent), никогда примитивы напрямую — благодаря этому
+  остальные пресеты (Фаза 2) добавятся переопределением примитивов,
+  без переписывания компонентов.
+*/
+:root {
+  --cream-50: #faf7f1;
+  --cream-100: #f3ece1;
+  --cream-200: #efe8dc;
+  --cream-300: #e4dacb;
+  --brown-900: #2a211b;
+  --brown-600: #5c4a3d;
+  --brown-400: #8a7466;
+  --terracotta-500: #a6633b;
+  --terracotta-600: #8f5230;
+  --green-600: #3e7c4f;
+  --red-600: #b3432b;
+  --white: #ffffff;
+  /* Текст на акцентной кнопке — отдельный примитив, а не «белый»:
+     в тёмной теме акцент светлеет, и надпись на нём должна темнеть. */
+  --on-accent-fg: #ffffff;
+}
+
+@theme inline {
+  --color-surface: var(--cream-50);
+  --color-raised: var(--white);
+  --color-muted: var(--cream-100);
+  --color-line: var(--cream-200);
+  --color-line-strong: var(--cream-300);
+  --color-ink: var(--brown-900);
+  --color-ink-muted: var(--brown-600);
+  --color-ink-faint: var(--brown-400);
+  --color-accent: var(--terracotta-500);
+  --color-accent-strong: var(--terracotta-600);
+  --color-on-accent: var(--on-accent-fg);
+  --color-success: var(--green-600);
+  --color-danger: var(--red-600);
+
+  /* Заголовки — PT Serif, текст — Manrope (подключены в layout.tsx через
+     next/font, переменные *-src). Фолбэки на случай, если шрифт не загрузился. */
+  --font-heading: var(--font-heading-src), Georgia, "Times New Roman", serif;
+  --font-body:
+    var(--font-body-src), system-ui, -apple-system, "Segoe UI", Roboto,
+    "Helvetica Neue", sans-serif;
+}
+
+body {
+  background: var(--cream-50);
+  color: var(--brown-900);
+  font-family: var(--font-body);
+  -webkit-font-smoothing: antialiased;
+}
+
+h1,
+h2,
+h3 {
+  font-family: var(--font-heading);
+  letter-spacing: 0.005em;
+}
+
+/* Плавный скролл к категории по клику на липкий таб */
+html {
+  scroll-behavior: smooth;
+}
+
+@keyframes slide-up {
+  from {
+    transform: translateY(120%);
+  }
+  to {
+    transform: translateY(0);
+  }
+}
+
+/* Появление снизу — экран статуса, шторки */
+@keyframes rise {
+  from {
+    opacity: 0;
+    transform: translateY(14px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+/* Мягкий pop — счётчик при добавлении, чип */
+@keyframes popin {
+  0% {
+    transform: scale(0.7);
+    opacity: 0.3;
+  }
+  60% {
+    transform: scale(1.06);
+  }
+  100% {
+    transform: scale(1);
+    opacity: 1;
+  }
+}
+
+/* «Готово!» — короткий акцент на галочке, без прыгающего макета */
+@keyframes pop {
+  0% {
+    transform: scale(0.6);
+    opacity: 0;
+  }
+  60% {
+    transform: scale(1.12);
+    opacity: 1;
+  }
+  100% {
+    transform: scale(1);
+  }
+}
+
+/*
+  Тёмная тема. Меняем ТОЛЬКО примитивы — семантические токены и все
+  компоненты остаются нетронутыми, ровно ради этого двухслойная схема.
+
+  Акцент осветлён (#c07a4c вместо #a6633b): исходная терракота на тёмном фоне
+  даёт контраст около 3:1, для текста на кнопке этого мало.
+*/
+@media (prefers-color-scheme: dark) {
+  :root {
+    --cream-50: #17120f; /* фон страницы */
+    --cream-100: #241d18; /* приглушённые плашки */
+    --cream-200: #302620; /* линии */
+    --cream-300: #3d3129; /* линии заметнее */
+    --brown-900: #f4ece2; /* основной текст */
+    --brown-600: #c9b8a8; /* вторичный текст */
+    --brown-400: #9c8a7b; /* подписи */
+    --terracotta-500: #c07a4c;
+    --terracotta-600: #a6633b;
+    --green-600: #4f9a63;
+    --red-600: #d4674c;
+    --white: #201a16; /* «поднятые» поверхности: карточки, шторки */
+    /* на светлой терракоте читается тёмный текст: 5:1 против 2.6:1 у белого */
+    --on-accent-fg: #1b1310;
+  }
+
+  /* Фото на тёмном фоне бьют по глазам — чуть приглушаем */
+  img {
+    filter: brightness(0.92);
+  }
+}
+
+/* Уважаем системную настройку «меньше движения» */
+@media (prefers-reduced-motion: reduce) {
+  html {
+    scroll-behavior: auto;
+  }
+
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+  }
+}
+
+/* Печать наклеек и тейбл-тентов (/admin/qr).
+ *
+ * Размеры здесь в миллиметрах, а не в rem: наклейку режут ножницами по
+ * пунктиру и клеят на стол, поэтому она должна выйти из принтера ровно
+ * такой, какой задумана, независимо от масштаба шрифта в браузере.
+ */
+@media print {
+  @page {
+    size: A4;
+    margin: 8mm;
+  }
+
+  /* Печатаем на белом: фоновая заливка съедает картридж и мешает
+     сканеру ловить код */
+  body {
+    background: #fff;
+    color: #000;
+  }
+
+  .sticker-sheet {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 0;
+  }
+
+  .sticker {
+    width: 65mm;
+    height: 65mm;
+    box-sizing: border-box;
+    padding: 4mm;
+    /* пунктир — линия реза, по ней же удобно ровнять нож */
+    border: 0.2mm dashed #999;
+    break-inside: avoid;
+  }
+
+  /* Тейбл-тент: лист сгибается пополам, QR смотрит в обе стороны зала.
+     Верхняя половина печатается вверх ногами — после сгиба она встаёт
+     правильно. */
+  .tent {
+    width: 100%;
+    height: 128mm;
+    box-sizing: border-box;
+    break-inside: avoid;
+    display: flex;
+    flex-direction: column;
+  }
+
+  .tent-face {
+    flex: 1;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    padding: 4mm;
+  }
+
+  .tent-face-flipped {
+    transform: rotate(180deg);
+  }
+
+  .tent-fold {
+    border-top: 0.2mm dashed #999;
+  }
+}

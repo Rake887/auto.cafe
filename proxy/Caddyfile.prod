@@ -1,0 +1,25 @@
+# Продакшн: свой домен, сертификат Caddy получает и продлевает сам.
+# Домен и почта для Let's Encrypt подставляются из переменных окружения.
+{$SITE_DOMAIN} {
+	# почта нужна удостоверяющему центру для писем об истечении сертификата
+	tls {$ACME_EMAIL}
+
+	encode zstd gzip
+
+	# /api/m/demo -> api:8000/m/demo (префикс срезается)
+	handle_path /api/* {
+		reverse_proxy api:8000
+	}
+
+	handle {
+		reverse_proxy web:3000
+	}
+
+	header {
+		# домен только по HTTPS: браузер запомнит и не пойдёт по http
+		Strict-Transport-Security "max-age=31536000; includeSubDomains"
+		X-Content-Type-Options "nosniff"
+		X-Frame-Options "SAMEORIGIN"
+		Referrer-Policy "strict-origin-when-cross-origin"
+	}
+}
