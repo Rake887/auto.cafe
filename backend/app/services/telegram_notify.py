@@ -11,8 +11,8 @@ from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
 
 from app.bot.instance import bot
 from app.core.config import get_settings
-from app.models import Order, Point
-from app.services.orders import order_label
+from app.models import Order, OrderStatus, Point
+from app.services.orders import CANCEL_REASONS, order_label
 
 logger = logging.getLogger(__name__)
 
@@ -39,6 +39,26 @@ def _kb(buttons: list[tuple[str, str]]) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         inline_keyboard=[[InlineKeyboardButton(text=t, callback_data=d)] for t, d in buttons]
     )
+
+
+def stop_categories_kb(categories: list[tuple[int, str]]) -> InlineKeyboardMarkup:
+    """Категории меню кнопками. По одной в строке: жмут пальцем на бегу."""
+    return _kb([(name, f"stopcat:{cid}") for cid, name in categories])
+
+
+def stop_dishes_kb(dishes: list[tuple[int, str, bool]]) -> InlineKeyboardMarkup:
+    """Блюда категории с отметкой наличия. Тап переключает.
+
+    Значок показывает текущее состояние, а не действие: «✅ Плов» значит
+    «плов есть», и после нажатия он станет «🚫 Плов». Обратное прочтение
+    («нажми, чтобы включить») путало бы на скорости.
+    """
+    rows = [
+        (f"{'✅' if active else '🚫'} {name}", f"stoptog:{did}")
+        for did, name, active in dishes
+    ]
+    rows.append(("← К категориям", "stopback"))
+    return _kb(rows)
 
 
 async def notify_new_order(
@@ -91,7 +111,9 @@ async def notify_new_order(
 
     try:
         msg = await bot.send_message(
-            settings.group_chat_id, text, reply_markup=_kb(buttons)
+            settings.group_chat_id,
+            text,
+            reply_markup=_kb(buttons + [("🚫 Отменить", f"cancel:{order.id}")]),
         )
         return msg.message_id
     except Exception:
@@ -126,7 +148,12 @@ async def edit_order_presence_confirmed(
             text,
             chat_id=settings.group_chat_id,
             message_id=message_id,
-            reply_markup=_kb([("✅ Принял", f"accept:{order.id}")]),
+            reply_markup=_kb(
+                [
+                    ("✅ Принял", f"accept:{order.id}"),
+                    ("🚫 Отменить", f"cancel:{order.id}"),
+                ]
+            ),
         )
     except Exception:
         logger.exception("Failed to edit presence message for order %s", order.id)
@@ -149,7 +176,12 @@ async def edit_order_accepted(
             + f"\n\n👨‍🍳 Принял: {html.escape(actor_name)}",
             chat_id=settings.group_chat_id,
             message_id=message_id,
-            reply_markup=_kb([("🍽 Готово", f"ready:{order.id}")]),
+            reply_markup=_kb(
+                [
+                    ("🍽 Готово", f"ready:{order.id}"),
+                    ("🚫 Отменить", f"cancel:{order.id}"),
+                ]
+            ),
         )
     except Exception:
         logger.exception("Failed to edit accepted message for order %s", order.id)
@@ -190,7 +222,12 @@ async def notify_order_ready(
             settings.group_chat_id,
             f"🔔 <b>Заказ {order_label(order, zone_name)} готов!</b>\n"
             f"{html.escape(point.label)} — отнести гостю.",
-            reply_markup=_kb([("🙋 Обслуживаю", f"serve:{order.id}")]),
+            reply_markup=_kb(
+                [
+                    ("🙋 Обслуживаю", f"serve:{order.id}"),
+                    ("🚫 Отменить", f"cancel:{order.id}"),
+                ]
+            ),
         )
         return msg.message_id
     except Exception:
@@ -219,6 +256,71 @@ async def edit_order_served(
         )
     except Exception:
         logger.exception("Failed to edit served message for order %s", order.id)
+
+
+def order_buttons(order: Order, needs_presence: bool = False) -> list[tuple[str, str]]:
+    """Кнопки, соответствующие текущему состоянию заказа.
+
+    Нужны в двух местах: при первой отрисовке и когда официант передумал
+    отменять и надо вернуть всё как было.
+    """
+    if order.status is OrderStatus.new:
+        first = (
+            ("🪑 Гость за столом", f"presence:{order.id}")
+            if needs_presence
+            else ("✅ Принял", f"accept:{order.id}")
+        )
+    elif order.status is OrderStatus.accepted:
+        first = ("🍽 Готово", f"ready:{order.id}")
+    elif order.status is OrderStatus.ready:
+        first = ("🙋 Обслуживаю", f"serve:{order.id}")
+    else:
+        return []
+    return [first, ("🚫 Отменить", f"cancel:{order.id}")]
+
+
+async def ask_cancel_reason(message_id: int, order: Order) -> None:
+    """Второй тап отмены: спрашиваем причину.
+
+    Меняем только кнопки, текст заказа остаётся на месте — официанту всё ещё
+    надо видеть, что именно он собирается отменить. Подтверждение здесь не
+    формальность: кнопка стоит рядом с «Готово», и промах в час пик убил бы
+    заказ молча.
+    """
+    settings = get_settings()
+    if bot is None:
+        return
+    try:
+        await bot.edit_message_reply_markup(
+            chat_id=settings.group_chat_id,
+            message_id=message_id,
+            reply_markup=_kb(
+                [
+                    ("🪑 За столом никого", f"cancelx:{order.id}:empty_table"),
+                    ("🙅 Гость передумал", f"cancelx:{order.id}:guest_left"),
+                    ("← Не отменять", f"cancelno:{order.id}"),
+                ]
+            ),
+        )
+    except Exception:
+        logger.exception("Failed to ask cancel reason for order %s", order.id)
+
+
+async def restore_order_buttons(
+    message_id: int, order: Order, needs_presence: bool = False
+) -> None:
+    """Официант передумал отменять — вернуть кнопки по текущему статусу."""
+    settings = get_settings()
+    if bot is None:
+        return
+    try:
+        await bot.edit_message_reply_markup(
+            chat_id=settings.group_chat_id,
+            message_id=message_id,
+            reply_markup=_kb(order_buttons(order, needs_presence)),
+        )
+    except Exception:
+        logger.exception("Failed to restore buttons for order %s", order.id)
 
 
 async def edit_order_cancelled(

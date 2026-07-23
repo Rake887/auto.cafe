@@ -71,6 +71,9 @@ class Order(Base):
     # Когда бот напомнил про заказ, который никто не взял в работу.
     # Заполнено — повторно не напоминаем.
     reminded_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    # Почему заказ отменили. Владельцу важна разница: «стол пуст» — это
+    # выброшенная еда, «гость передумал» до готовки — потерь нет.
+    cancel_reason: Mapped[str | None] = mapped_column(String(32))
 
     items: Mapped[list["OrderItem"]] = relationship(
         back_populates="order", lazy="selectin"

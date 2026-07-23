@@ -21,7 +21,7 @@ from app.models import (
     Zone,
 )
 from app.schemas.admin import AdminOrderItemOut, AdminOrderOut
-from app.services.orders import advance_order_status, order_label
+from app.services.orders import CANCEL_REASONS, advance_order_status, order_label
 from app.services import telegram_notify
 from app.services.staff_lookup import staff_by_telegram
 from app.services.stats import PERIODS, period_start
@@ -131,6 +131,7 @@ async def admin_orders(
             ],
             cooked_by=actors.get((order.id, OrderStatus.accepted)),
             served_by=actors.get((order.id, OrderStatus.served)),
+            cancel_reason=CANCEL_REASONS.get(order.cancel_reason or ""),
         )
         for order, label, zone_name in rows
     ]
@@ -185,4 +186,5 @@ async def cancel_order(
         ],
         cooked_by=actors.get((cancelled.id, OrderStatus.accepted)),
         served_by=actors.get((cancelled.id, OrderStatus.served)),
+        cancel_reason=CANCEL_REASONS.get(cancelled.cancel_reason or ""),
     )

@@ -125,11 +125,21 @@ class DishesNotFound(Exception):
         self.dish_ids = dish_ids
 
 
-# Разрешённые переходы статусов заказа
+# Разрешённые переходы статусов заказа.
+# Отменить можно и готовое блюдо: официант доносит его до стола и обнаруживает,
+# что там никого. Еда потеряна, но выручки по этому заказу нет — значит и в
+# статистику он попасть не должен.
 ALLOWED_TRANSITIONS: dict[OrderStatus, set[OrderStatus]] = {
     OrderStatus.new: {OrderStatus.accepted, OrderStatus.cancelled},
     OrderStatus.accepted: {OrderStatus.ready, OrderStatus.cancelled},
-    OrderStatus.ready: {OrderStatus.served},
+    OrderStatus.ready: {OrderStatus.served, OrderStatus.cancelled},
+}
+
+# Почему отменили. Разница существенная: «стол пуст» на готовом заказе — это
+# выброшенные продукты, а «гость передумал» до готовки не стоит ничего.
+CANCEL_REASONS = {
+    "empty_table": "за столом никого",
+    "guest_left": "гость передумал",
 }
 
 
@@ -394,6 +404,7 @@ async def advance_order_status(
     order_id: int,
     to_status: OrderStatus,
     actor_telegram_id: int | None,
+    cancel_reason: str | None = None,
 ) -> Order | None:
     """Перевести заказ в новый статус с проверкой допустимости перехода.
 
@@ -409,6 +420,8 @@ async def advance_order_status(
 
     from_status = order.status
     order.status = to_status
+    if to_status is OrderStatus.cancelled and cancel_reason in CANCEL_REASONS:
+        order.cancel_reason = cancel_reason
     session.add(
         OrderStatusLog(
             order_id=order.id,

@@ -8,8 +8,12 @@ from aiogram.filters import Command, CommandObject, CommandStart
 from aiogram.types import CallbackQuery, ChatMemberUpdated, Message
 from sqlalchemy import select
 
+from app.core.config import get_settings
 from app.core.db import async_session_factory
 from app.models import (
+    Branch,
+    Category,
+    Dish,
     Order,
     OrderStatus,
     Point,
@@ -79,6 +83,173 @@ async def chat_id(message: Message) -> None:
     )
 
 
+async def _active_staff(telegram_id: int) -> Staff | None:
+    """Зарегистрированный и не уволенный сотрудник, иначе None."""
+    async with async_session_factory() as session:
+        return await session.scalar(
+            select(Staff).where(
+                Staff.telegram_chat_id == telegram_id,
+                Staff.is_active.is_(True),
+            )
+        )
+
+
+async def _branch_id() -> int | None:
+    settings = get_settings()
+    async with async_session_factory() as session:
+        return await session.scalar(
+            select(Branch.id)
+            .where(Branch.organization_id == settings.demo_organization_id)
+            .order_by(Branch.id)
+            .limit(1)
+        )
+
+
+async def _categories(branch_id: int) -> list[tuple[int, str]]:
+    async with async_session_factory() as session:
+        rows = (
+            await session.execute(
+                select(Category.id, Category.name)
+                .where(
+                    Category.branch_id == branch_id,
+                    Category.is_archived.is_(False),
+                )
+                .order_by(Category.sort_order, Category.id)
+            )
+        ).all()
+    return [(cid, name) for cid, name in rows]
+
+
+async def _dishes(category_id: int) -> tuple[str, list[tuple[int, str, bool]]]:
+    async with async_session_factory() as session:
+        name = await session.scalar(
+            select(Category.name).where(Category.id == category_id)
+        )
+        rows = (
+            await session.execute(
+                select(Dish.id, Dish.name, Dish.is_active)
+                .where(
+                    Dish.category_id == category_id,
+                    Dish.is_archived.is_(False),
+                )
+                .order_by(Dish.sort_order, Dish.id)
+            )
+        ).all()
+    return name or "", [(did, dname, active) for did, dname, active in rows]
+
+
+STOP_HINT = (
+    "Что сейчас есть, а чего нет. Тап переключает — гости увидят "
+    "изменение в течение двадцати секунд."
+)
+
+
+def _stop_text(category_name: str) -> str:
+    return f"<b>{category_name}</b>\n{STOP_HINT}"
+
+
+@router.message(Command("stop", "стоп"))
+async def stop_list(message: Message) -> None:
+    """Стоп-лист из чата: блюдо кончилось на кухне, а не в кабинете владельца.
+
+    Право есть только у зарегистрированного персонала: спрятать блюдо — это
+    потерянная выручка до тех пор, пока кто-нибудь не заметит, а в общем чате
+    заведения могут сидеть посторонние.
+    """
+    if message.from_user is None:
+        return
+    if await _active_staff(message.from_user.id) is None:
+        await message.answer(
+            "Стоп-лист ведут сотрудники заведения. Попросите владельца "
+            "прислать вам личную ссылку-приглашение."
+        )
+        return
+
+    branch_id = await _branch_id()
+    if branch_id is None:
+        await message.answer("Заведение не найдено.")
+        return
+    categories = await _categories(branch_id)
+    if not categories:
+        await message.answer("В меню пока нет категорий.")
+        return
+    await message.answer(
+        STOP_HINT, reply_markup=telegram_notify.stop_categories_kb(categories)
+    )
+
+
+@router.callback_query(F.data.startswith("stopcat:"))
+async def stop_category(callback: CallbackQuery) -> None:
+    """Открыть блюда выбранной категории."""
+    category_id = _order_id_from(callback.data)
+    if category_id is None or callback.from_user is None:
+        await callback.answer("Некорректные данные кнопки")
+        return
+    if await _active_staff(callback.from_user.id) is None:
+        await callback.answer("Только для сотрудников заведения", show_alert=True)
+        return
+
+    name, dishes = await _dishes(category_id)
+    if callback.message is not None:
+        await callback.message.edit_text(
+            _stop_text(name),
+            reply_markup=telegram_notify.stop_dishes_kb(dishes),
+        )
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("stoptog:"))
+async def stop_toggle(callback: CallbackQuery) -> None:
+    """Переключить наличие блюда."""
+    dish_id = _order_id_from(callback.data)
+    if dish_id is None or callback.from_user is None:
+        await callback.answer("Некорректные данные кнопки")
+        return
+    if await _active_staff(callback.from_user.id) is None:
+        await callback.answer("Только для сотрудников заведения", show_alert=True)
+        return
+
+    async with async_session_factory() as session:
+        dish = await session.get(Dish, dish_id)
+        if dish is None or dish.is_archived:
+            await callback.answer("Блюдо не найдено", show_alert=True)
+            return
+        dish.is_active = not dish.is_active
+        category_id, dish_name, now_active = (
+            dish.category_id,
+            dish.name,
+            dish.is_active,
+        )
+        await session.commit()
+
+    name, dishes = await _dishes(category_id)
+    if callback.message is not None:
+        await callback.message.edit_text(
+            _stop_text(name),
+            reply_markup=telegram_notify.stop_dishes_kb(dishes),
+        )
+    await callback.answer(
+        f"{dish_name}: {'в продаже' if now_active else 'убрано из меню'}"
+    )
+
+
+@router.callback_query(F.data == "stopback")
+async def stop_back(callback: CallbackQuery) -> None:
+    """Вернуться к списку категорий."""
+    if callback.from_user is None or await _active_staff(callback.from_user.id) is None:
+        await callback.answer("Только для сотрудников заведения", show_alert=True)
+        return
+    branch_id = await _branch_id()
+    if branch_id is None or callback.message is None:
+        await callback.answer()
+        return
+    await callback.message.edit_text(
+        STOP_HINT,
+        reply_markup=telegram_notify.stop_categories_kb(await _categories(branch_id)),
+    )
+    await callback.answer()
+
+
 @router.message(CommandStart())
 async def start_plain(message: Message) -> None:
     await message.answer(
@@ -96,7 +267,7 @@ async def fallback(message: Message) -> None:
         return  # в группе на болтовню персонала не отвечаем
     await message.answer(
         "Я принимаю заказы из QR-меню и показываю их кухне.\n"
-        "Доступные команды: /start, /chatid."
+        "Доступные команды: /start, /chatid, /stop — что закончилось на кухне."
     )
 
 
@@ -165,6 +336,80 @@ async def on_presence(callback: CallbackQuery) -> None:
             visit_total,
         )
     await callback.answer("Стол подтверждён — можно готовить")
+
+
+async def _order_and_presence(order_id: int) -> tuple[Order | None, bool]:
+    """Заказ и признак «за стол ещё не поручились» — для отрисовки кнопок."""
+    async with async_session_factory() as session:
+        order = await session.get(Order, order_id)
+        if order is None:
+            return None, False
+        needs = False
+        if order.session_id is not None:
+            visit = await session.get(TableSession, order.session_id)
+            needs = visit is not None and visit.confirmed_at is None
+        return order, needs
+
+
+@router.callback_query(F.data.startswith("cancel:"))
+async def on_cancel_ask(callback: CallbackQuery) -> None:
+    """Первый тап отмены: показать причины, ничего не меняя."""
+    order_id = _order_id_from(callback.data)
+    if order_id is None:
+        await callback.answer("Некорректные данные кнопки")
+        return
+    order, _ = await _order_and_presence(order_id)
+    if order is None or order.status in (OrderStatus.served, OrderStatus.cancelled):
+        await callback.answer("Этот заказ отменить уже нельзя", show_alert=True)
+        return
+    if callback.message is not None:
+        await telegram_notify.ask_cancel_reason(callback.message.message_id, order)
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("cancelno:"))
+async def on_cancel_abort(callback: CallbackQuery) -> None:
+    """Передумали отменять — вернуть прежние кнопки."""
+    order_id = _order_id_from(callback.data)
+    if order_id is None:
+        await callback.answer("Некорректные данные кнопки")
+        return
+    order, needs_presence = await _order_and_presence(order_id)
+    if order is not None and callback.message is not None:
+        await telegram_notify.restore_order_buttons(
+            callback.message.message_id, order, needs_presence
+        )
+    await callback.answer("Отмена отменена")
+
+
+@router.callback_query(F.data.startswith("cancelx:"))
+async def on_cancel_confirm(callback: CallbackQuery) -> None:
+    """Второй тап: отменяем заказ с указанной причиной."""
+    parts = (callback.data or "").split(":")
+    if len(parts) != 3 or not parts[1].isdigit():
+        await callback.answer("Некорректные данные кнопки")
+        return
+    order_id, reason = int(parts[1]), parts[2]
+
+    async with async_session_factory() as session:
+        order = await advance_order_status(
+            session,
+            order_id,
+            OrderStatus.cancelled,
+            callback.from_user.id,
+            cancel_reason=reason,
+        )
+    if order is None:
+        await callback.answer("Заказ уже обслужен или отменён", show_alert=True)
+        return
+
+    actor = await _actor_name(callback.from_user.id, callback.from_user.full_name)
+    point, zone_name = await _load_order_point(order)
+    if callback.message is not None:
+        await telegram_notify.edit_order_cancelled(
+            callback.message.message_id, order, point, actor, zone_name
+        )
+    await callback.answer("Заказ отменён")
 
 
 @router.callback_query(F.data.startswith("accept:"))

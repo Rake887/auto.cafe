@@ -184,6 +184,8 @@ export interface AdminOrder {
   is_remote: boolean;
   cooked_by: string | null;
   served_by: string | null;
+  /** «за столом никого» — почему отменили; null, если причину не выбирали */
+  cancel_reason: string | null;
 }
 
 export interface AdminReview {

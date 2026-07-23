@@ -115,6 +115,13 @@ function OrderCard({
         </p>
       )}
 
+      {order.cancel_reason && (
+        /* Владельцу важна разница: «за столом никого» — это выброшенная еда */
+        <p className="mt-2 rounded-xl bg-muted px-3 py-2 text-xs text-ink-muted">
+          Отменён: {order.cancel_reason}
+        </p>
+      )}
+
       <ul className="mt-3 space-y-1">
         {order.items.map((item, i) => (
           <li key={i} className="flex justify-between gap-3 text-sm">

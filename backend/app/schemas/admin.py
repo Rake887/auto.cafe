@@ -174,6 +174,9 @@ class AdminOrderOut(BaseModel):
     # кто принял на кухне и кто отнёс; None — до этого шага ещё не дошло
     cooked_by: str | None
     served_by: str | None
+    # человеческая причина отмены. None — отменили из кабинета или причину
+    # не выбирали; сама отмена видна по status
+    cancel_reason: str | None
 
 
 class AdminReviewOut(BaseModel):
