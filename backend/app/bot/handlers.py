@@ -22,7 +22,11 @@ from app.models import (
     TableSession,
     Zone,
 )
-from app.services.orders import advance_order_status, visit_totals
+from app.services.orders import (
+    advance_order_status,
+    mark_item_unavailable,
+    visit_totals,
+)
 from app.services import telegram_notify
 
 logger = logging.getLogger(__name__)
@@ -412,6 +416,96 @@ async def on_cancel_confirm(callback: CallbackQuery) -> None:
     await callback.answer("Заказ отменён")
 
 
+@router.callback_query(F.data.startswith("oos:"))
+async def on_out_of_stock_ask(callback: CallbackQuery) -> None:
+    """Первый тап «Блюдо кончилось»: показать позиции заказа, ничего не меняя.
+
+    Отмечать может только персонал: вычеркнутая позиция уходит гостю как
+    отказ и уносит блюдо в стоп-лист, а в общем чате бывают посторонние.
+    """
+    order_id = _order_id_from(callback.data)
+    if order_id is None or callback.from_user is None:
+        await callback.answer("Некорректные данные кнопки")
+        return
+    if await _active_staff(callback.from_user.id) is None:
+        await callback.answer("Только для сотрудников заведения", show_alert=True)
+        return
+
+    order, _ = await _order_and_presence(order_id)
+    if order is None or order.status in (OrderStatus.served, OrderStatus.cancelled):
+        await callback.answer("Этот заказ уже закрыт", show_alert=True)
+        return
+    if callback.message is not None:
+        await telegram_notify.ask_unavailable_item(callback.message.message_id, order)
+    await callback.answer("Чего не оказалось?")
+
+
+@router.callback_query(F.data.startswith("back:"))
+async def on_back(callback: CallbackQuery) -> None:
+    """Отказ от уточняющего шага — вернуть кнопки по текущему статусу заказа.
+
+    Общая для всех вопросов, которые бот задаёт поверх заказа: «чего нет?»,
+    «нести сейчас?». Отмена спрашивает своё — у неё формулировка другая.
+    """
+    order_id = _order_id_from(callback.data)
+    if order_id is None:
+        await callback.answer("Некорректные данные кнопки")
+        return
+    order, needs_presence = await _order_and_presence(order_id)
+    if order is not None and callback.message is not None:
+        await telegram_notify.restore_order_buttons(
+            callback.message.message_id, order, needs_presence
+        )
+    await callback.answer("Хорошо")
+
+
+@router.callback_query(F.data.startswith("oosx:"))
+async def on_out_of_stock_confirm(callback: CallbackQuery) -> None:
+    """Второй тап: позиция вычёркивается из заказа, гость видит это у себя.
+
+    Заказ из-за этого не встаёт: остальные блюда готовятся дальше. А если
+    вычеркнули последнее — отдавать нечего, и заказ отменяется целиком.
+    """
+    item_id = _order_id_from(callback.data)
+    if item_id is None or callback.from_user is None:
+        await callback.answer("Некорректные данные кнопки")
+        return
+    if await _active_staff(callback.from_user.id) is None:
+        await callback.answer("Только для сотрудников заведения", show_alert=True)
+        return
+
+    async with async_session_factory() as session:
+        marked = await mark_item_unavailable(session, item_id, callback.from_user.id)
+    if marked is None:
+        await callback.answer("Позиция уже вычеркнута или заказ закрыт", show_alert=True)
+        return
+    order, dish_name, order_cancelled = marked
+
+    actor = await _actor_name(callback.from_user.id, callback.from_user.full_name)
+    point, zone_name = await _load_order_point(order)
+    if callback.message is not None:
+        if order_cancelled:
+            await telegram_notify.edit_order_cancelled(
+                callback.message.message_id, order, point, actor, zone_name
+            )
+        else:
+            _, needs_presence = await _order_and_presence(order.id)
+            await telegram_notify.edit_order_item_unavailable(
+                callback.message.message_id,
+                order,
+                point,
+                dish_name,
+                actor,
+                zone_name,
+                needs_presence,
+            )
+    await callback.answer(
+        f"{dish_name}: гостю сообщили, блюдо убрано из меню"
+        if not order_cancelled
+        else f"{dish_name} было последним — заказ отменён"
+    )
+
+
 @router.callback_query(F.data.startswith("accept:"))
 async def on_accept(callback: CallbackQuery) -> None:
     """Повар жмёт [Принял]: new -> accepted, редактируем сообщение заказа."""
@@ -459,13 +553,56 @@ async def on_ready(callback: CallbackQuery) -> None:
     await callback.answer("Отмечено готовым")
 
 
+async def _visit_pending(order_id: int) -> tuple[Order | None, list]:
+    """Заказ и другие заказы его стола, которые ещё не отдали гостю."""
+    async with async_session_factory() as session:
+        order = await session.get(Order, order_id)
+        if order is None:
+            return None, []
+        siblings = await visit_orders(session, order.session_id)
+        return order, [o for o in siblings if o.in_progress and o.id != order_id]
+
+
 @router.callback_query(F.data.startswith("serve:"))
 async def on_serve(callback: CallbackQuery) -> None:
-    """Официант жмёт [Обслуживаю]: ready -> served, цикл заказа завершён."""
+    """Первый тап [Обслуживаю]. Если стол ещё чего-то ждёт — переспросить.
+
+    Гость, дозаказавший десерт, обычно хочет получить его вместе с кофе, а не
+    сидеть перед пустой чашкой. Но бывает и наоборот, поэтому это вопрос, а не
+    запрет: решает официант, он видит стол.
+    """
     order_id = _order_id_from(callback.data)
     if order_id is None:
         await callback.answer("Некорректные данные кнопки")
         return
+
+    order, pending = await _visit_pending(order_id)
+    if order is not None and pending and callback.message is not None:
+        await telegram_notify.ask_serve_anyway(
+            callback.message.message_id, order, pending
+        )
+        await callback.answer(
+            "По этому столу ещё не отдано: "
+            + ", ".join(f"{o.label} — {telegram_notify.STATUS_WORDS[o.status]}" for o in pending)
+            + ".\nНести этот заказ сейчас?",
+            show_alert=True,
+        )
+        return
+    await _serve(callback, order_id)
+
+
+@router.callback_query(F.data.startswith("servex:"))
+async def on_serve_confirm(callback: CallbackQuery) -> None:
+    """Официант решил нести, не дожидаясь остального по столу."""
+    order_id = _order_id_from(callback.data)
+    if order_id is None:
+        await callback.answer("Некорректные данные кнопки")
+        return
+    await _serve(callback, order_id)
+
+
+async def _serve(callback: CallbackQuery, order_id: int) -> None:
+    """ready -> served, цикл заказа завершён."""
     async with async_session_factory() as session:
         order = await advance_order_status(
             session, order_id, OrderStatus.served, callback.from_user.id

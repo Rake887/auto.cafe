@@ -125,7 +125,10 @@ async def admin_orders(
             is_remote=order.is_remote,
             items=[
                 AdminOrderItemOut(
-                    name=i.dish_name_snapshot, qty=i.qty, price=i.price_snapshot
+                    name=i.dish_name_snapshot,
+                    qty=i.qty,
+                    price=i.price_snapshot,
+                    unavailable=i.unavailable_at is not None,
                 )
                 for i in order.items
             ],
@@ -180,7 +183,10 @@ async def cancel_order(
         is_remote=cancelled.is_remote,
         items=[
             AdminOrderItemOut(
-                name=i.dish_name_snapshot, qty=i.qty, price=i.price_snapshot
+                name=i.dish_name_snapshot,
+                qty=i.qty,
+                price=i.price_snapshot,
+                unavailable=i.unavailable_at is not None,
             )
             for i in cancelled.items
         ],

@@ -125,15 +125,27 @@ function OrderCard({
       <ul className="mt-3 space-y-1">
         {order.items.map((item, i) => (
           <li key={i} className="flex justify-between gap-3 text-sm">
-            <span className="min-w-0 flex-1 truncate text-ink">
+            <span
+              className={`min-w-0 flex-1 truncate ${
+                item.unavailable ? "text-ink-faint line-through" : "text-ink"
+              }`}
+            >
               {item.name}
               {item.qty > 1 && (
                 <span className="text-ink-faint"> × {item.qty}</span>
               )}
             </span>
-            <span className="shrink-0 text-ink-muted tabular-nums">
-              {formatPrice(item.price * item.qty)}
-            </span>
+            {item.unavailable ? (
+              /* Кухня не отдала — в «Итого» этой позиции уже нет. Владельцу
+                 это видеть важнее цены: столько выручки заведение потеряло */
+              <span className="shrink-0 text-xs text-ink-faint">
+                кончилось
+              </span>
+            ) : (
+              <span className="shrink-0 text-ink-muted tabular-nums">
+                {formatPrice(item.price * item.qty)}
+              </span>
+            )}
           </li>
         ))}
       </ul>

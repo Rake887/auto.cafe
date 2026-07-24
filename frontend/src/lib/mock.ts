@@ -123,6 +123,8 @@ export async function mockCreateOrder(
       dish_name: dish?.name ?? "Блюдо",
       qty: item.qty,
       price: dish?.price ?? 0,
+      // отметить «кончилось» может только официант из бота — мок этого не умеет
+      unavailable: false,
     };
   });
   const total = lines.reduce((sum, l) => sum + l.price * l.qty, 0);
@@ -148,23 +150,46 @@ export async function mockCallWaiter(
   lastCallByToken.set(pointToken, Date.now());
 }
 
+// id мок-заказа = момент создания, поэтому статус выводится из возраста
+function mockStatus(orderId: number): OrderState["status"] {
+  const elapsedSec = (Date.now() - orderId) / 1000;
+  return elapsedSec < 8 ? "new" : elapsedSec < 20 ? "accepted" : elapsedSec < 30 ? "ready" : "served";
+}
+
+const mockNumber = (orderId: number) => `Основной зал №${(orderId % 90) + 1}`;
+const mockTotal = (orderId: number) =>
+  (itemsByOrderId.get(orderId) ?? []).reduce((sum, l) => sum + l.price * l.qty, 0);
+
 export async function mockFetchOrder(orderId: number): Promise<OrderState> {
   await delay(200);
-  const elapsedSec = (Date.now() - orderId) / 1000;
-  const status =
-    elapsedSec < 8 ? "new" : elapsedSec < 20 ? "accepted" : elapsedSec < 30 ? "ready" : "served";
+  const status = mockStatus(orderId);
   const items = itemsByOrderId.get(orderId) ?? [];
+  // мок-заведение однозальное, все заказы сессии считаем одним визитом —
+  // иначе блок «Ваш стол» нельзя было бы посмотреть без бэкенда
+  const visitIds = [...itemsByOrderId.keys()].sort((a, b) => a - b);
   return {
     id: orderId,
-    // мок-заведение однозальное, номер идёт по «Основному залу»
-    number: `Основной зал №${(orderId % 90) + 1}`,
+    number: mockNumber(orderId),
     status,
     created_at: new Date(orderId).toISOString(),
-    total: items.reduce((sum, l) => sum + l.price * l.qty, 0),
+    total: mockTotal(orderId),
     comment: commentByOrderId.get(orderId) ?? null,
     // в моках сотрудники условные — экран статуса всё равно должен их показать
     cooked_by: status === "new" ? null : "Асхат",
     served_by: status === "served" ? "Данияр" : null,
     items,
+    visit:
+      visitIds.length < 2
+        ? null
+        : {
+            point_label: "Стол 12",
+            orders: visitIds.map((id) => ({
+              id,
+              number: mockNumber(id),
+              status: mockStatus(id),
+              total: mockTotal(id),
+            })),
+            total: visitIds.reduce((sum, id) => sum + mockTotal(id), 0),
+          },
   };
 }

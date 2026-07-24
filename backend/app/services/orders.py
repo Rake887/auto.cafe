@@ -1,9 +1,10 @@
+from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from ipaddress import ip_address
 from math import asin, cos, radians, sin, sqrt
 from zoneinfo import ZoneInfo
 
-from sqlalchemy import func, select
+from sqlalchemy import case, func, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -87,6 +88,15 @@ def closed_reason(branch: Branch, now_local: datetime | None = None) -> str | No
     return "Сейчас заведение закрыто"
 
 
+def label_from_parts(
+    order_id: int, zone_seq: int | None, zone_name: str | None
+) -> str:
+    """Человеческое имя заказа из частей — для выборок без ORM-объекта."""
+    if zone_seq is None or zone_name is None:
+        return f"#{order_id}"
+    return f"{zone_name} №{zone_seq}"
+
+
 def order_label(order: Order, zone_name: str | None) -> str:
     """Как заказ называется для людей: «Терраса №14».
 
@@ -94,9 +104,7 @@ def order_label(order: Order, zone_name: str | None) -> str:
     невозможно ни выкрикнуть, ни сверить. Номер внутри зоны за день короткий.
     Старые заказы зоны не знают — для них остаётся «#id».
     """
-    if order.zone_seq is None or zone_name is None:
-        return f"#{order.id}"
-    return f"{zone_name} №{order.zone_seq}"
+    return label_from_parts(order.id, order.zone_seq, zone_name)
 
 
 async def _next_zone_seq(session: AsyncSession, zone_id: int) -> int:
@@ -140,7 +148,15 @@ ALLOWED_TRANSITIONS: dict[OrderStatus, set[OrderStatus]] = {
 CANCEL_REASONS = {
     "empty_table": "за столом никого",
     "guest_left": "гость передумал",
+    "out_of_stock": "всё заказанное закончилось",
 }
+
+# Позиции, за которые гость платит. То, чего на кухне не оказалось, выпадает
+# и из счёта, и из статистики: этой еды не было, и выручки по ней тоже.
+SOLD_ITEM = OrderItem.unavailable_at.is_(None)
+LINE_TOTAL = case(
+    (SOLD_ITEM, OrderItem.price_snapshot * OrderItem.qty), else_=0
+)
 
 
 async def get_order_by_client_request_id(
@@ -244,28 +260,74 @@ async def _current_session(
     return visit
 
 
-async def visit_totals(
+@dataclass(frozen=True)
+class VisitOrder:
+    """Заказ визита в том виде, в каком его показывают человеку.
+
+    Без состава: и гостю на странице, и официанту в чате нужно «что на каком
+    этапе и на сколько», а не перечень блюд с трёх соседних телефонов.
+    """
+
+    id: int
+    label: str
+    status: OrderStatus
+    total: int
+
+    @property
+    def in_progress(self) -> bool:
+        """Заказ ещё не на столе — его нельзя считать закрытым."""
+        return self.status is not OrderStatus.served
+
+
+async def visit_orders(
     session: AsyncSession, session_id: int | None
-) -> tuple[int, int]:
-    """Сколько заказов и на какую сумму набрал визит. (0, 0) — визита нет."""
+) -> list[VisitOrder]:
+    """Живые заказы визита, старые сверху. Отменённые не в счёт: за них не платят.
+
+    Один запрос на весь визит — он нужен сразу в трёх местах (сообщение
+    дозаказа, подтверждение подачи, страница гостя), и в каждом хочется тех же
+    цифр, что и в счёте.
+    """
     if session_id is None:
-        return 0, 0
-    line_total = OrderItem.price_snapshot * OrderItem.qty
-    row = (
+        return []
+    rows = (
         await session.execute(
             select(
-                func.count(func.distinct(Order.id)),
-                func.coalesce(func.sum(line_total), 0),
+                Order.id,
+                Order.zone_seq,
+                Zone.name,
+                Order.status,
+                func.coalesce(func.sum(LINE_TOTAL), 0),
             )
             .select_from(Order)
+            # зона может быть не задана у старых заказов — они станут «#id»
+            .outerjoin(Zone, Zone.id == Order.zone_id)
             .join(OrderItem, OrderItem.order_id == Order.id)
             .where(
                 Order.session_id == session_id,
                 Order.status != OrderStatus.cancelled,
             )
+            .group_by(Order.id, Order.zone_seq, Zone.name, Order.status)
+            .order_by(Order.id)
         )
-    ).one()
-    return int(row[0]), int(row[1])
+    ).all()
+    return [
+        VisitOrder(
+            id=order_id,
+            label=label_from_parts(order_id, zone_seq, zone_name),
+            status=status,
+            total=int(total),
+        )
+        for order_id, zone_seq, zone_name, status, total in rows
+    ]
+
+
+async def visit_totals(
+    session: AsyncSession, session_id: int | None
+) -> tuple[int, int]:
+    """Сколько заказов и на какую сумму набрал визит. (0, 0) — визита нет."""
+    orders = await visit_orders(session, session_id)
+    return len(orders), sum(o.total for o in orders)
 
 
 async def _too_frequent(session: AsyncSession, point_id: int) -> bool:
@@ -397,6 +459,59 @@ async def create_order(
             raise
         return existing, False
     return order, True
+
+
+async def mark_item_unavailable(
+    session: AsyncSession, item_id: int, actor_telegram_id: int | None
+) -> tuple[Order, str, bool] | None:
+    """Официант отметил, что заказанного блюда не оказалось.
+
+    Возвращает (заказ, название блюда, отменён ли заказ целиком). None —
+    позиции нет, её уже вычеркнули или заказ закрыт: обслуженный заказ уже
+    на столе, а в отменённом вычёркивать нечего.
+
+    Заодно блюдо уходит в стоп-лист. Кончилось оно не персонально у этого
+    гостя: пока никто не спрятал его из меню, следующий стол закажет то же
+    самое и упрётся в тот же отказ.
+    """
+    item = await session.get(OrderItem, item_id)
+    if item is None:
+        return None
+
+    order = await session.scalar(
+        select(Order).where(Order.id == item.order_id).with_for_update()
+    )
+    if (
+        order is None
+        or item.unavailable_at is not None
+        or order.status in (OrderStatus.served, OrderStatus.cancelled)
+    ):
+        await session.rollback()
+        return None
+
+    item.unavailable_at = datetime.now(UTC)
+
+    dish = await session.get(Dish, item.dish_id)
+    if dish is not None:
+        dish.is_active = False
+
+    # Вычеркнули последнее — отдавать нечего, и держать пустой заказ в работе
+    # незачем: гостю честнее сразу увидеть отмену, чем ждать пустой поднос.
+    nothing_left = all(i.unavailable_at is not None for i in order.items)
+    if nothing_left:
+        session.add(
+            OrderStatusLog(
+                order_id=order.id,
+                from_status=order.status,
+                to_status=OrderStatus.cancelled,
+                actor_telegram_id=actor_telegram_id,
+            )
+        )
+        order.status = OrderStatus.cancelled
+        order.cancel_reason = "out_of_stock"
+
+    await session.commit()
+    return order, item.dish_name_snapshot, nothing_left
 
 
 async def advance_order_status(

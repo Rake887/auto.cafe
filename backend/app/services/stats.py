@@ -20,6 +20,7 @@ from app.models import (
     Zone,
 )
 from app.core.config import Settings, get_settings
+from app.services.orders import LINE_TOTAL, SOLD_ITEM
 from app.services.staff_lookup import staff_by_telegram
 from app.schemas.admin import (
     AdminStats,
@@ -62,8 +63,9 @@ async def collect_stats(
     )
 
     paid = Order.status != OrderStatus.cancelled
-    # сумма заказа = сумма его позиций по ценам на момент заказа
-    line_total = OrderItem.price_snapshot * OrderItem.qty
+    # сумма заказа = сумма его позиций по ценам на момент заказа, за вычетом
+    # того, что кухня не смогла отдать (LINE_TOTAL обнуляет такие позиции)
+    line_total = LINE_TOTAL
 
     revenue, orders_count = (
         await session.execute(
@@ -149,7 +151,8 @@ async def collect_stats(
                 )
                 .select_from(OrderItem)
                 .join(Order, Order.id == OrderItem.order_id)
-                .where(Order.branch_id == branch_id, paid)
+                # непроданное в топ блюд не идёт: гость его не получил
+                .where(Order.branch_id == branch_id, paid, SOLD_ITEM)
                 .group_by(OrderItem.dish_name_snapshot)
                 .order_by(func.sum(OrderItem.qty).desc())
                 .limit(10),
@@ -177,7 +180,7 @@ async def collect_stats(
                 )
                 .select_from(OrderItem)
                 .join(Order, Order.id == OrderItem.order_id)
-                .where(Order.branch_id == branch_id, paid),
+                .where(Order.branch_id == branch_id, paid, SOLD_ITEM),
                 since,
             )
         )
@@ -194,7 +197,7 @@ async def collect_stats(
                 )
                 .select_from(OrderItem)
                 .join(Order, Order.id == OrderItem.order_id)
-                .where(Order.branch_id == branch_id, paid, known_cost)
+                .where(Order.branch_id == branch_id, paid, known_cost, SOLD_ITEM)
                 .group_by(OrderItem.dish_name_snapshot)
                 .order_by(func.sum(line_profit).desc())
                 .limit(10),
@@ -292,7 +295,7 @@ async def _buckets(
     """
     local_time = func.timezone(settings.display_timezone, Order.created_at)
     bucket = func.date_part(unit, local_time)
-    line_total = OrderItem.price_snapshot * OrderItem.qty
+    line_total = LINE_TOTAL
 
     rows = (
         await session.execute(
@@ -331,7 +334,7 @@ async def _zone_stats(
     session: AsyncSession, branch_id: int, since: datetime | None
 ) -> list[ZoneStatOut]:
     """Выручка и средний чек по залам. Заказы до появления зон пропускаем."""
-    line_total = OrderItem.price_snapshot * OrderItem.qty
+    line_total = LINE_TOTAL
     rows = (
         await session.execute(
             _in_period(
@@ -376,7 +379,7 @@ async def _staff_stats(
     Группируем по telegram-id нажавшего: имя и роль подтягиваем из staff,
     а если человек не зарегистрирован — показываем сам id.
     """
-    line_total = OrderItem.price_snapshot * OrderItem.qty
+    line_total = LINE_TOTAL
     rows = (
         await session.execute(
             _in_period(

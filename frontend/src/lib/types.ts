@@ -167,6 +167,8 @@ export interface AdminOrderItem {
   name: string;
   qty: number;
   price: number;
+  /** блюдо кончилось, официант вычеркнул его из заказа — гость за него не платит */
+  unavailable: boolean;
 }
 
 export interface AdminOrder {
@@ -299,6 +301,21 @@ export interface OrderItemOut {
   dish_name: string;
   qty: number;
   price: number;
+  /** официант отметил, что блюдо кончилось; в total эта позиция не входит */
+  unavailable: boolean;
+}
+
+export interface VisitOrder {
+  id: number;
+  number: string;
+  status: OrderStatus;
+  total: number;
+}
+
+export interface Visit {
+  point_label: string;
+  orders: VisitOrder[];
+  total: number;
 }
 
 export interface OrderState {
@@ -312,4 +329,6 @@ export interface OrderState {
   cooked_by: string | null;
   served_by: string | null;
   items: OrderItemOut[];
+  /** стол дозаказывал: счёт будет один на все эти заказы. null — заказ один */
+  visit: Visit | null;
 }

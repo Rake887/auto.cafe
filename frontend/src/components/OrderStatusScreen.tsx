@@ -5,7 +5,7 @@ import { useEffect, useState } from "react";
 import { fetchOrderStatus } from "@/lib/api";
 import { formatElapsed, formatPrice, plural } from "@/lib/format";
 import { t, withLang, type Lang } from "@/lib/i18n";
-import type { OrderState } from "@/lib/types";
+import type { OrderState, OrderStatus, Visit } from "@/lib/types";
 import { CheckIcon } from "./icons";
 import { RatingCard } from "./RatingCard";
 
@@ -18,11 +18,84 @@ const STEPS = [
   { status: "served", title: "served", hint: "servedHint", icon: "🍽️" },
 ] as const;
 
+// Короткая подпись этапа для списка заказов стола: в строке нет места на
+// «Повар взял заказ в работу», нужен глагол в одно слово
+const SHORT_STATUS = {
+  new: "statusNew",
+  accepted: "statusAccepted",
+  ready: "statusReady",
+  served: "statusServed",
+  cancelled: "statusServed",
+} as const satisfies Record<OrderStatus, string>;
+
 function waitingLabel(createdAt: string, now: number, lang: Lang): string {
   const elapsed = formatElapsed(createdAt, now);
   return elapsed === "только что"
     ? t(lang, "justNow")
     : `${t(lang, "waiting")} ${elapsed}`;
+}
+
+/** Заказы стола за визит: гость дозаказывал, а счёт ему принесут один. */
+function VisitCard({
+  visit,
+  currentOrderId,
+  lang,
+}: {
+  visit: Visit;
+  currentOrderId: number;
+  lang: Lang;
+}) {
+  return (
+    <div className="mt-6 rounded-3xl bg-raised p-5 border border-line/60 shadow-xs">
+      <div className="flex items-baseline justify-between border-b border-line/60 pb-3">
+        <h2 className="font-extrabold text-ink">{t(lang, "yourTable")}</h2>
+        <span className="text-xs font-semibold text-ink-faint">
+          {visit.point_label}
+        </span>
+      </div>
+
+      <ul className="mt-3 space-y-2">
+        {visit.orders.map((o) => {
+          const isCurrent = o.id === currentOrderId;
+          return (
+            <li
+              key={o.id}
+              className="flex items-baseline justify-between gap-2 text-sm"
+            >
+              <span className="min-w-0 flex-1 truncate">
+                <span className={isCurrent ? "font-bold text-ink" : "text-ink"}>
+                  {o.number}
+                </span>
+                <span className="text-ink-faint">
+                  {" · "}
+                  {t(lang, SHORT_STATUS[o.status])}
+                  {/* помечаем тот заказ, чью страницу гость сейчас смотрит —
+                      иначе среди трёх одинаковых строк себя не найти */}
+                  {isCurrent && ` · ${t(lang, "thisOrder")}`}
+                </span>
+              </span>
+              <span className="shrink-0 tabular-nums text-ink-muted">
+                {formatPrice(o.total)}
+              </span>
+            </li>
+          );
+        })}
+      </ul>
+
+      <div className="mt-3 flex items-baseline justify-between border-t border-line/60 pt-3">
+        <span className="text-sm font-semibold text-ink">
+          {t(lang, "tableTotal")}
+        </span>
+        <span className="text-xl font-extrabold text-ink tabular-nums">
+          {formatPrice(visit.total)}
+        </span>
+      </div>
+
+      <p className="mt-2 text-xs leading-relaxed text-ink-faint">
+        {t(lang, "oneBillHint")}
+      </p>
+    </div>
+  );
 }
 
 export function OrderStatusScreen({
@@ -70,16 +143,25 @@ export function OrderStatusScreen({
 
   const status = order?.status ?? "new";
   const backToMenu = token ? withLang(`/m/${token}`, lang) : null;
+  const soldOut = order?.items.filter((i) => i.unavailable) ?? [];
+  // Заказ отменили именно из-за стоп-листа, если вычеркнули всё до последней
+  // позиции: тогда гостю надо объяснить причину, а не просто сказать «отменён»
+  const soldOutEverything =
+    soldOut.length > 0 && soldOut.length === order?.items.length;
 
   if (status === "cancelled") {
     return (
       <main className="flex min-h-dvh flex-col items-center justify-center gap-2 bg-surface px-8 text-center">
         <div className="flex h-20 w-20 items-center justify-center rounded-full bg-red-500/10 text-3xl">
-          ❌
+          {soldOutEverything ? "🍽️" : "❌"}
         </div>
-        <h1 className="text-2xl font-bold text-ink">Заказ отменён</h1>
+        <h1 className="text-2xl font-bold text-ink">
+          {soldOutEverything ? t(lang, "soldOutAllTitle") : "Заказ отменён"}
+        </h1>
         <p className="text-ink-muted">
-          Обратитесь к официанту, если это произошло по ошибке.
+          {soldOutEverything
+            ? t(lang, "soldOutAllHint")
+            : "Обратитесь к официанту, если это произошло по ошибке."}
         </p>
         {backToMenu && (
           <Link
@@ -96,7 +178,9 @@ export function OrderStatusScreen({
   const currentIndex = STEPS.findIndex((s) => s.status === status);
   const current = STEPS[currentIndex] ?? STEPS[0];
   const finished = status === "ready" || status === "served";
-  const itemCount = order?.items.reduce((sum, i) => sum + i.qty, 0) ?? 0;
+  // вычеркнутое не считаем: гость его не получит и за него не платит
+  const itemCount =
+    order?.items.reduce((sum, i) => (i.unavailable ? sum : sum + i.qty), 0) ?? 0;
 
   return (
     <main lang={lang} className="min-h-dvh bg-surface px-5 pt-10 pb-12">
@@ -144,6 +228,32 @@ export function OrderStatusScreen({
             )
           )}
         </div>
+
+        {/* Блюдо кончилось: официант отметил это в боте, гость узнаёт здесь.
+            Роль alert, а не обычный блок: экран обновляется поллингом, и
+            новость приходит на открытую страницу без действий гостя. */}
+        {soldOut.length > 0 && (
+          <div
+            role="alert"
+            className="mt-6 rounded-3xl border border-amber-500/40 bg-amber-500/10 p-4"
+          >
+            <p className="flex items-center gap-2 font-bold text-ink">
+              <span aria-hidden>🚫</span>
+              {t(lang, "soldOutTitle")}
+            </p>
+            <ul className="mt-2 space-y-1">
+              {soldOut.map((item, i) => (
+                <li key={i} className="text-[15px] font-semibold text-ink">
+                  {item.dish_name}
+                  {item.qty > 1 && ` × ${item.qty}`}
+                </li>
+              ))}
+            </ul>
+            <p className="mt-2 text-xs leading-relaxed text-ink-muted">
+              {t(lang, "soldOutHint")}
+            </p>
+          </div>
+        )}
 
         {/* Visual Stepper */}
         <div className="mt-8 rounded-3xl bg-raised p-4 border border-line/60 shadow-xs">
@@ -207,15 +317,36 @@ export function OrderStatusScreen({
               <ul className="mt-4 space-y-2.5">
                 {order.items.map((item, i) => (
                   <li key={i} className="flex items-baseline justify-between text-[15px]">
-                    <span className="min-w-0 flex-1 text-ink font-medium">
+                    <span
+                      className={`min-w-0 flex-1 font-medium ${
+                        item.unavailable
+                          ? "text-ink-faint line-through"
+                          : "text-ink"
+                      }`}
+                    >
                       {item.dish_name}
                       {item.qty > 1 && (
-                        <span className="text-accent font-bold"> × {item.qty}</span>
+                        <span
+                          className={
+                            item.unavailable ? "" : "text-accent font-bold"
+                          }
+                        >
+                          {" "}
+                          × {item.qty}
+                        </span>
                       )}
                     </span>
-                    <span className="tabular-nums text-ink font-semibold">
-                      {formatPrice(item.price * item.qty)}
-                    </span>
+                    {item.unavailable ? (
+                      /* Цену не показываем: она уже не в сумме, и рядом с
+                         вычеркнутым названием читалась бы как «всё же спишут» */
+                      <span className="shrink-0 rounded-full bg-amber-500/15 px-2 py-0.5 text-[11px] font-bold uppercase text-amber-700 dark:text-amber-300">
+                        {t(lang, "soldOutBadge")}
+                      </span>
+                    ) : (
+                      <span className="tabular-nums text-ink font-semibold">
+                        {formatPrice(item.price * item.qty)}
+                      </span>
+                    )}
                   </li>
                 ))}
               </ul>
@@ -238,6 +369,12 @@ export function OrderStatusScreen({
             </>
           )}
         </div>
+
+        {/* Гость дозаказал — показываем стол целиком. Иначе он видит только
+            последний заказ, а счёт получит на все и удивится сумме. */}
+        {order?.visit && (
+          <VisitCard visit={order.visit} currentOrderId={orderId} lang={lang} />
+        )}
 
         {status === "served" && (
           <>

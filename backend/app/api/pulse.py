@@ -30,6 +30,7 @@ from app.schemas.admin import (
     OpenVisitOut,
     PulseOut,
 )
+from app.services.orders import LINE_TOTAL
 from app.services.staff_lookup import staff_by_telegram
 from app.services.stats import PERIODS, period_start
 
@@ -85,7 +86,7 @@ async def pulse(
 
     # Открытые визиты с итогом: официанту нужен один счёт на стол, а не три
     # отдельных заказа с трёх телефонов
-    line_total = OrderItem.price_snapshot * OrderItem.qty
+    line_total = LINE_TOTAL
     visits = (
         await session.execute(
             select(

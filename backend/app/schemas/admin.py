@@ -155,6 +155,8 @@ class AdminOrderItemOut(BaseModel):
     name: str
     qty: int
     price: int
+    # блюдо кончилось, официант вычеркнул его из заказа — в total не входит
+    unavailable: bool = False
 
 
 class AdminOrderOut(BaseModel):

@@ -83,7 +83,10 @@ class Order(Base):
 
     @property
     def total(self) -> int:
-        return sum(i.price_snapshot * i.qty for i in self.items)
+        """Сумма к оплате. За то, чего не оказалось, гость не платит."""
+        return sum(
+            i.price_snapshot * i.qty for i in self.items if i.unavailable_at is None
+        )
 
 
 class OrderItem(Base):
@@ -100,6 +103,10 @@ class OrderItem(Base):
     # Себестоимость на тот же момент. None — на момент заказа её не считали,
     # такие позиции из расчёта прибыли исключаются
     cost_snapshot: Mapped[int | None] = mapped_column()
+    # Когда официант отметил, что блюдо кончилось. Позицию не удаляем: гостю
+    # надо показать, чего именно он не дождётся, а владельцу — что заведение
+    # не смогло отдать. В деньги и статистику такая позиция не идёт.
+    unavailable_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
 
     order: Mapped[Order] = relationship(back_populates="items")
 

@@ -14,7 +14,14 @@ from app.models import (
     TableSession,
     Zone,
 )
-from app.schemas.orders import OrderCreate, OrderCreated, OrderItemOut, OrderOut
+from app.schemas.orders import (
+    OrderCreate,
+    OrderCreated,
+    OrderItemOut,
+    OrderOut,
+    VisitOrderOut,
+    VisitOut,
+)
 from app.services import telegram_notify
 from app.services.orders import (
     DishesNotFound,
@@ -24,6 +31,7 @@ from app.services.orders import (
     client_ip,
     create_order,
     order_label,
+    visit_orders,
     visit_totals,
 )
 from app.services.staff_lookup import staff_name
@@ -130,6 +138,29 @@ async def _order_actors(
     return result
 
 
+async def _visit_out(session: AsyncSession, order: Order) -> VisitOut | None:
+    """Визит стола для страницы гостя. None — заказ за визит единственный.
+
+    Гость, дозаказавший второй раз, попадает на страницу нового заказа и
+    теряет из виду первый. Счёт при этом один на стол — значит и на экране
+    он должен видеть стол целиком, иначе сумма в конце станет сюрпризом.
+    """
+    orders = await visit_orders(session, order.session_id)
+    if len(orders) < 2:
+        return None
+    point_label = await session.scalar(
+        select(Point.label).where(Point.id == order.point_id)
+    )
+    return VisitOut(
+        point_label=point_label or "",
+        orders=[
+            VisitOrderOut(id=o.id, number=o.label, status=o.status, total=o.total)
+            for o in orders
+        ],
+        total=sum(o.total for o in orders),
+    )
+
+
 @router.get("/{order_id}", response_model=OrderOut)
 async def get_order(order_id: int, session: AsyncSession = Depends(get_session)):
     """Статус заказа — для поллинга с фронта («Готовим» / «Готово»)."""
@@ -142,6 +173,7 @@ async def get_order(order_id: int, session: AsyncSession = Depends(get_session))
         select(Zone.name).where(Zone.id == order.zone_id)
     )
     return OrderOut(
+        visit=await _visit_out(session, order),
         id=order.id,
         number=order_label(order, zone_name),
         status=order.status,
@@ -151,7 +183,12 @@ async def get_order(order_id: int, session: AsyncSession = Depends(get_session))
         cooked_by=actors.get(OrderStatus.accepted),
         served_by=actors.get(OrderStatus.served),
         items=[
-            OrderItemOut(dish_name=i.dish_name_snapshot, qty=i.qty, price=i.price_snapshot)
+            OrderItemOut(
+                dish_name=i.dish_name_snapshot,
+                qty=i.qty,
+                price=i.price_snapshot,
+                unavailable=i.unavailable_at is not None,
+            )
             for i in order.items
         ],
     )

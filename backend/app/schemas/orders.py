@@ -34,6 +34,36 @@ class OrderItemOut(BaseModel):
     dish_name: str
     qty: int
     price: int
+    # Официант отметил, что блюдо кончилось. Позиция остаётся в списке —
+    # гость должен увидеть, чего именно не будет, а не гадать, почему сумма
+    # стала меньше. В total такая позиция уже не входит.
+    unavailable: bool = False
+
+
+class VisitOrderOut(BaseModel):
+    """Соседний заказ того же стола — без состава, только этап и сумма.
+
+    Состав не отдаём намеренно: за столом могут сидеть чужие друг другу люди
+    (гость сканирует QR там, где до него сидела другая компания), а счёт всё
+    равно общий — для него достаточно суммы.
+    """
+
+    id: int
+    number: str
+    status: OrderStatus
+    total: int
+
+
+class VisitOut(BaseModel):
+    """Визит стола: все заказы до закрытия счёта.
+
+    Приходит только когда заказов больше одного — на первом показывать
+    «итого по столу», равное самому заказу, незачем.
+    """
+
+    point_label: str
+    orders: list[VisitOrderOut]
+    total: int
 
 
 class OrderOut(BaseModel):
@@ -52,3 +82,6 @@ class OrderOut(BaseModel):
     cooked_by: str | None
     served_by: str | None
     items: list[OrderItemOut]
+    # Стол дозаказывал: этот заказ не единственный за визит. None — заказ
+    # один, и гостю нечего подвязывать.
+    visit: VisitOut | None = None
